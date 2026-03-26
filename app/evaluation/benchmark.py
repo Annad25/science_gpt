@@ -62,6 +62,10 @@ DEFAULT_BENCHMARK_QUESTIONS: list[dict[str, str]] = [
         "query": "How does machine learning improve healthcare outcomes in countries with low health expenditure?",
         "expected_type": "hybrid",
     },
+    {
+        "query": "What is Germanys life expectancy and recent development in its healthcare?",
+        "expected_type": "hybrid",
+    },
     # Out-of-domain (should refuse)
     {
         "query": "What is the recipe for chocolate cake?",

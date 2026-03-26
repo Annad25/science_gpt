@@ -168,6 +168,9 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         t0 = time.perf_counter()
         routing = await state.router.route(req.query)
         routing_ms = (time.perf_counter() - t0) * 1000
+        query_parts = state.structured_retriever.build_query_parts(
+            req.query, routing.query_type
+        )
 
         # ── Stage 2: Retrieval ───────────────────────────────────────
         t0 = time.perf_counter()
@@ -176,6 +179,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
             query_type=routing.query_type,
             vector_retriever=state.vector_retriever,
             structured_retriever=state.structured_retriever,
+            query_parts=query_parts,
         )
 
         # ── Stage 2b: Dynamic ingestion if relevance is low ─────────
@@ -193,8 +197,13 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
                     threshold,
                 )
                 t_dyn = time.perf_counter()
+                dynamic_query = (
+                    query_parts.text_query
+                    if routing.query_type == QueryType.HYBRID
+                    else req.query
+                )
                 dynamic_chunks = await dynamic_ingest_and_retry(
-                    query=req.query,
+                    query=dynamic_query,
                     qdrant=state.qdrant,
                     encoder=state.encoder,
                     top_k=settings.retrieval_top_k,
@@ -299,10 +308,10 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
 
 
 @app.post("/ingest")
-async def ingest_endpoint() -> dict[str, Any]:
+async def ingest_endpoint(force: bool = False) -> dict[str, Any]:
     """Re-run the ingestion pipeline and invalidate the cache."""
     trace_id_var.set(f"ingest-{uuid.uuid4().hex[:6]}")
-    logger.info("[API] Manual ingestion triggered")
+    logger.info("[API] Manual ingestion triggered (force=%s)", force)
 
     try:
         await state.cache.invalidate()
@@ -310,6 +319,7 @@ async def ingest_endpoint() -> dict[str, Any]:
             qdrant=state.qdrant,
             encoder=state.encoder,
             who_store=state.who_store,
+            force=force,
         )
         state.ingestion_stats = stats
         return {"status": "ok", "stats": stats}
@@ -384,12 +394,16 @@ async def evaluate_endpoint(req: BenchmarkRequest | None = None) -> BenchmarkRes
         try:
             # Run the full pipeline
             routing = await state.router.route(query)
+            query_parts = state.structured_retriever.build_query_parts(
+                query, routing.query_type
+            )
 
             chunks = await run_retrieval(
                 query=query,
                 query_type=routing.query_type,
                 vector_retriever=state.vector_retriever,
                 structured_retriever=state.structured_retriever,
+                query_parts=query_parts,
             )
 
             # Dynamic ingestion check
@@ -399,8 +413,13 @@ async def evaluate_endpoint(req: BenchmarkRequest | None = None) -> BenchmarkRes
                 avg = state.vector_retriever.avg_score(vector_chunks)
                 if avg < settings.dynamic_ingestion_score_threshold and avg > 0:
                     dynamic_triggered = True
+                    dynamic_query = (
+                        query_parts.text_query
+                        if routing.query_type == QueryType.HYBRID
+                        else query
+                    )
                     dynamic_chunks = await dynamic_ingest_and_retry(
-                        query=query,
+                        query=dynamic_query,
                         qdrant=state.qdrant,
                         encoder=state.encoder,
                         top_k=settings.retrieval_top_k,

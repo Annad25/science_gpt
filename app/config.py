@@ -36,7 +36,8 @@ class Settings(BaseSettings):
     embedding_dimension: int = 384
 
     # ── Qdrant ───────────────────────────────────────────────────────────
-    qdrant_mode: Literal["memory", "docker", "cloud"] = "memory"
+    qdrant_mode: Literal["memory", "file", "docker", "cloud"] = "file"
+    qdrant_path: str = "./qdrant_data"
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
     qdrant_collection: str = "science_chunks"
@@ -57,6 +58,7 @@ class Settings(BaseSettings):
         "machine learning healthcare",
         "climate change science",
     ]
+    arxiv_cache_path: str = "./data/arxiv_cache.json"
 
     # ── Dynamic ingestion (on-demand fetch for unknown topics) ────────
     dynamic_ingestion_enabled: bool = True

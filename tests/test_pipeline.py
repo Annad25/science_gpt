@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -15,6 +17,13 @@ from httpx import ASGITransport, AsyncClient
 
 # Ensure a dummy API key for tests
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-key")
+
+
+def _workspace_temp_file(name: str) -> Path:
+    """Create a writable test path inside the workspace."""
+    root = Path(".test_artifacts")
+    root.mkdir(exist_ok=True)
+    return root / f"{name}-{uuid4().hex}.json"
 
 
 # ── Unit tests ───────────────────────────────────────────────────────────────
@@ -128,6 +137,116 @@ class TestCache:
         assert cache.size == 0
 
 
+class TestPaperCache:
+    """Tests for the disk-backed arXiv paper cache."""
+
+    def test_save_and_load_roundtrip(self):
+        from app.ingestion.paper_cache import PaperCache
+
+        cache_path = _workspace_temp_file("arxiv_cache")
+        paper = {
+            "arxiv_id": "1234.5678",
+            "title": "Cached Paper",
+            "text": "cached text",
+            "source": "arXiv:test",
+            "authors": ["A. Researcher"],
+            "published": "2026-01-01T00:00:00",
+            "categories": ["cs.AI"],
+        }
+
+        cache = PaperCache(cache_path=cache_path)
+        cache.put(paper)
+        cache.save()
+
+        restored = PaperCache(cache_path=cache_path)
+        restored.load()
+
+        assert restored.size == 1
+        assert restored.get("1234.5678") == paper
+
+
+class TestPipelineCaching:
+    """Tests for startup ingestion reuse of cached papers."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_with_cache_falls_back_to_cached_papers(self, monkeypatch):
+        from app.ingestion.paper_cache import PaperCache
+        from app.ingestion import pipeline
+
+        cache_path = _workspace_temp_file("arxiv_cache")
+        cached_paper = {
+            "arxiv_id": "1234.5678",
+            "title": "Cached Paper",
+            "text": "cached text",
+            "source": "arXiv:test",
+            "authors": ["A. Researcher"],
+            "published": "2026-01-01T00:00:00",
+            "categories": ["cs.AI"],
+        }
+
+        cache = PaperCache(cache_path=cache_path)
+        cache.put(cached_paper)
+        cache.save()
+        cache.load()
+
+        async def failing_fetch(**_: dict):
+            raise RuntimeError("network unavailable")
+
+        monkeypatch.setattr(pipeline, "fetch_arxiv_papers", failing_fetch)
+
+        papers = await pipeline._fetch_with_cache(cache)
+        assert papers == [cached_paper]
+
+    @pytest.mark.asyncio
+    async def test_fetch_with_cache_passes_cached_papers_and_saves_new_ones(
+        self,
+        monkeypatch,
+    ):
+        from app.ingestion.paper_cache import PaperCache
+        from app.ingestion import pipeline
+
+        cache_path = _workspace_temp_file("arxiv_cache")
+        cached_paper = {
+            "arxiv_id": "1234.5678",
+            "title": "Cached Paper",
+            "text": "cached text",
+            "source": "arXiv:test",
+            "authors": ["A. Researcher"],
+            "published": "2026-01-01T00:00:00",
+            "categories": ["cs.AI"],
+        }
+        new_paper = {
+            "arxiv_id": "9999.0001",
+            "title": "New Paper",
+            "text": "new text",
+            "source": "arXiv:new",
+            "authors": ["B. Researcher"],
+            "published": "2026-01-02T00:00:00",
+            "categories": ["cs.LG"],
+        }
+
+        cache = PaperCache(cache_path=cache_path)
+        cache.put(cached_paper)
+        cache.save()
+        cache.load()
+
+        observed: dict[str, dict] = {}
+
+        async def fake_fetch(**kwargs):
+            observed["cached_papers"] = kwargs["cached_papers"]
+            return [cached_paper, new_paper]
+
+        monkeypatch.setattr(pipeline, "fetch_arxiv_papers", fake_fetch)
+
+        papers = await pipeline._fetch_with_cache(cache)
+        assert len(papers) == 2
+        assert "1234.5678" in observed["cached_papers"]
+
+        restored = PaperCache(cache_path=cache_path)
+        restored.load()
+        assert restored.size == 2
+
+
 class TestModels:
     """Tests for Pydantic models."""
 
@@ -204,6 +323,24 @@ class TestWHODataStore:
         assert "Germany" in result
 
     @pytest.mark.asyncio
+    async def test_text_search_normalizes_possessives(self):
+        from app.ingestion.who_loader import WHODataStore
+
+        store = WHODataStore()
+        await store.load()
+        assert "Germany" in await store.text_search("Germany's life expectancy")
+        assert "Germany" in await store.text_search("germanys life expectancy")
+
+    @pytest.mark.asyncio
+    async def test_invalid_filter_column_raises(self):
+        from app.ingestion.who_loader import WHODataStore
+
+        store = WHODataStore()
+        await store.load()
+        with pytest.raises(ValueError):
+            await store.query(filters={"nation": "Germany"})
+
+    @pytest.mark.asyncio
     async def test_aggregate(self):
         from app.ingestion.who_loader import WHODataStore
 
@@ -215,3 +352,73 @@ class TestWHODataStore:
             agg_func="mean",
         )
         assert "region" in result
+
+
+class TestStructuredRetriever:
+    """Tests for hybrid decomposition and structured fallback behavior."""
+
+    @pytest.mark.asyncio
+    async def test_build_query_parts_for_hybrid(self):
+        from app.agents.retriever import StructuredRetriever
+        from app.ingestion.who_loader import WHODataStore
+        from app.models import QueryType
+
+        store = WHODataStore()
+        await store.load()
+        retriever = StructuredRetriever(store)
+
+        parts = retriever.build_query_parts(
+            "what is germanys life expectancy and recent development in its healthcare",
+            QueryType.HYBRID,
+        )
+
+        assert parts.structured_query == "life expectancy of Germany"
+        assert "Germany" in parts.text_query
+        assert "life" not in parts.text_query.lower()
+        assert "expectancy" not in parts.text_query.lower()
+
+    @pytest.mark.asyncio
+    async def test_empty_parse_uses_deterministic_structured_fallback(self, monkeypatch):
+        from app.agents.retriever import StructuredRetriever
+        from app.ingestion.who_loader import WHODataStore
+
+        store = WHODataStore()
+        await store.load()
+        retriever = StructuredRetriever(store)
+
+        async def fake_parse(_: str) -> dict:
+            return {}
+
+        monkeypatch.setattr(retriever, "_parse_query", fake_parse)
+
+        results = await retriever.retrieve(
+            "what is germanys life expectancy and recent development in its healthcare"
+        )
+
+        assert len(results) == 1
+        assert "Germany" in results[0].text
+        assert "year" in results[0].text.splitlines()[0]
+        assert "life_expectancy" in results[0].text.splitlines()[0]
+
+    @pytest.mark.asyncio
+    async def test_year_is_preserved_for_country_metric_queries(self, monkeypatch):
+        from app.agents.retriever import StructuredRetriever
+        from app.ingestion.who_loader import WHODataStore
+
+        store = WHODataStore()
+        await store.load()
+        retriever = StructuredRetriever(store)
+
+        async def fake_parse(_: str) -> dict:
+            return {
+                "filters": {"country": "Germany"},
+                "columns": ["country", "life_expectancy"],
+            }
+
+        monkeypatch.setattr(retriever, "_parse_query", fake_parse)
+
+        results = await retriever.retrieve("life expectancy of Germany")
+
+        assert len(results) == 1
+        header = results[0].text.splitlines()[0]
+        assert header == "country,year,life_expectancy"

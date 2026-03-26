@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.embeddings.encoder import EmbeddingEncoder
 from app.ingestion.arxiv_loader import fetch_arxiv_papers
 from app.ingestion.chunker import chunk_documents
+from app.ingestion.paper_cache import PaperCache
 from app.logging_cfg import get_logger
 from app.models import RetrievedChunk
 from app.vectorstore.qdrant_store import QdrantStore
@@ -53,10 +54,19 @@ async def dynamic_ingest_and_retry(
     logger.info("[DynamicIngest] Low relevance detected — fetching papers for: '%s'", query[:100])
 
     try:
+        paper_cache = PaperCache()
+        paper_cache.load()
+        cached_papers = {
+            paper["arxiv_id"]: paper
+            for paper in paper_cache.get_all()
+            if paper.get("arxiv_id")
+        }
+
         # 1. Fetch papers using the user's query as the arXiv search term
         papers = await fetch_arxiv_papers(
             queries=[query],
             max_papers_per_query=settings.dynamic_ingestion_max_papers,
+            cached_papers=cached_papers,
         )
 
         if not papers:
@@ -64,6 +74,8 @@ async def dynamic_ingest_and_retry(
             return []
 
         logger.info("[DynamicIngest] Fetched %d papers", len(papers))
+        paper_cache.put_many(papers)
+        paper_cache.save()
 
         # 2. Chunk the new papers
         chunks = chunk_documents(papers)

@@ -73,6 +73,38 @@ class QueryResponse(BaseModel):
 
 # ── Internal DTOs ────────────────────────────────────────────────────────────
 
+class StructuredQuerySpec(BaseModel):
+    """Validated structured retrieval plan for the WHO dataset."""
+
+    filters: dict[str, Any] = Field(default_factory=dict)
+    columns: list[str] = Field(default_factory=list)
+    agg_column: str | None = None
+    group_by: str | None = None
+    agg_func: str | None = None
+    text_search: str | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        """Return True when the spec has no executable instructions."""
+        return not any(
+            [
+                self.filters,
+                self.columns,
+                self.agg_column,
+                self.group_by,
+                self.text_search,
+            ]
+        )
+
+
+class HybridQueryParts(BaseModel):
+    """Split a mixed query into structured and text-focused subqueries."""
+
+    original_query: str
+    structured_query: str
+    text_query: str
+
+
 class RetrievedChunk(BaseModel):
     """A chunk returned by a retrieval agent."""
     text: str

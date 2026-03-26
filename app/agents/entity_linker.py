@@ -1,14 +1,10 @@
 """
-Entity Linker Agent — cross-source relationship traversal.
+Entity Linker Agent - cross-source relationship traversal.
 
 Extracts named entities from vector search results (e.g. country names,
 diseases, technologies) and looks them up in the structured data store.
 This bridges the gap between unstructured papers and structured datasets,
 enabling the Reasoner to synthesise answers that combine both sources.
-
-Example: a paper mentions "Germany's healthcare system" → entity linker
-finds "Germany" → fetches all WHO rows for Germany → appends as extra
-context alongside the paper chunks.
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ logger = get_logger(__name__)
 
 _ENTITY_EXTRACTION_PROMPT = """\
 Extract named entities from the text below that could be looked up in a
-structured health/science dataset.  Focus on:
+structured health/science dataset. Focus on:
 - Country names
 - Disease or condition names
 - Specific metrics (e.g. "life expectancy", "mortality rate")
@@ -59,17 +55,7 @@ class EntityLinker:
         chunks: list[RetrievedChunk],
         query: str,
     ) -> list[RetrievedChunk]:
-        """Extract entities from vector chunks and fetch matching structured data.
-
-        Args:
-            chunks: Retrieved vector chunks (from arXiv papers).
-            query: Original user query (also mined for entities).
-
-        Returns:
-            Original chunks plus any structured-data chunks found via
-            entity linking.  Returns original chunks unchanged if no
-            entities are found or linking fails.
-        """
+        """Extract entities from vector chunks and fetch matching structured data."""
         if self._store.df.empty:
             return chunks
 
@@ -94,12 +80,12 @@ class EntityLinker:
                         text=f"Structured data for '{entity}':\n{csv_data}",
                         source=f"Structured Data (entity: {entity})",
                         chunk_id=f"entity_link:{entity}",
-                        score=0.9,  # high score — exact entity match
+                        score=0.9,
                         metadata={"type": "entity_link", "entity": entity},
                     )
                 )
                 logger.info(
-                    "[EntityLinker] Linked entity '%s' → %d chars of structured data",
+                    "[EntityLinker] Linked entity '%s' -> %d chars of structured data",
                     entity,
                     len(csv_data),
                 )
@@ -114,7 +100,7 @@ class EntityLinker:
             return chunks
 
         except Exception:
-            logger.exception("[EntityLinker] Entity linking failed — returning original chunks")
+            logger.exception("[EntityLinker] Entity linking failed - returning original chunks")
             return chunks
 
     async def _extract_entities(
@@ -123,10 +109,11 @@ class EntityLinker:
         query: str,
     ) -> list[str]:
         """Use LLM to extract named entities from the query and top chunks."""
-        # Combine query + first 2 chunk texts for entity extraction
         combined = f"User query: {query}\n\n"
-        for i, c in enumerate(chunks[:2], 1):
-            combined += f"Source {i}: {c.text[:500]}\n\n"
+        for i, chunk in enumerate(chunks[:2], 1):
+            combined += f"Source {i}: {chunk.text[:500]}\n\n"
+
+        deterministic = self._store.find_countries(query)
 
         try:
             client = self._get_client()
@@ -142,14 +129,30 @@ class EntityLinker:
             raw = response.choices[0].message.content or "{}"
             raw = re.sub(r"```json?\s*", "", raw).replace("```", "").strip()
             data = json.loads(raw)
-            return data.get("entities", [])
+            return self._merge_entities(deterministic, data.get("entities", []))
         except Exception:
-            logger.warning("[EntityLinker] LLM entity extraction failed — using regex fallback")
-            return self._regex_extract(query)
+            logger.warning("[EntityLinker] LLM entity extraction failed - using regex fallback")
+            return self._merge_entities(deterministic, self._regex_extract(query))
+
+    @staticmethod
+    def _merge_entities(*groups: list[str]) -> list[str]:
+        """Merge entity lists while preserving order."""
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for entity in group:
+                if not entity or entity in seen:
+                    continue
+                seen.add(entity)
+                merged.append(entity)
+        return merged
 
     def _regex_extract(self, text: str) -> list[str]:
-        """Simple regex fallback: find capitalised multi-word names."""
-        # Match country-like names and capitalised terms
+        """Simple regex fallback: find country-like names from the query."""
+        deterministic = self._store.find_countries(text)
+        if deterministic:
+            return deterministic
+
         known_countries = {
             "germany", "india", "brazil", "japan", "china", "usa",
             "united states", "united kingdom", "france", "canada",
@@ -158,5 +161,5 @@ class EntityLinker:
             "italy", "spain",
         }
         text_lower = text.lower()
-        found = [c.title() for c in known_countries if c in text_lower]
-        return found[:5]  # cap at 5 entities
+        found = [country.title() for country in known_countries if country in text_lower]
+        return found[:5]

@@ -1,15 +1,19 @@
 """
 Qdrant vector store abstraction.
 
-Supports in-memory, Docker, and cloud backends via a single interface.
-All public methods are async-safe (Qdrant's gRPC client is sync, so
-we wrap calls in ``asyncio.to_thread``).
+Supports in-memory, file-based (persistent), Docker, and cloud backends
+via a single interface.  All public methods are async-safe (Qdrant's
+gRPC client is sync, so we wrap calls in ``asyncio.to_thread``).
+
+**File mode** (default) stores vectors on disk so they survive restarts.
+This avoids re-downloading PDFs and re-embedding on every server start.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from pathlib import Path
 from typing import Any
 
 from qdrant_client import QdrantClient, models
@@ -31,6 +35,13 @@ class QdrantStore:
         if settings.qdrant_mode == "memory":
             logger.info("[Qdrant] Initialising in-memory store")
             self._client = QdrantClient(location=":memory:")
+
+        elif settings.qdrant_mode == "file":
+            db_path = Path(settings.qdrant_path)
+            db_path.mkdir(parents=True, exist_ok=True)
+            logger.info("[Qdrant] Initialising file-based store at %s", db_path)
+            self._client = QdrantClient(path=str(db_path))
+
         elif settings.qdrant_mode == "docker":
             logger.info(
                 "[Qdrant] Connecting to Docker at %s:%d",
@@ -67,6 +78,16 @@ class QdrantStore:
             )
         else:
             logger.info("[Qdrant] Collection '%s' already exists", self._collection)
+
+    async def delete_collection(self) -> None:
+        """Delete the collection (used for forced re-ingestion)."""
+        try:
+            await asyncio.to_thread(
+                self._client.delete_collection, self._collection
+            )
+            logger.info("[Qdrant] Deleted collection '%s'", self._collection)
+        except Exception:
+            logger.warning("[Qdrant] Collection '%s' did not exist — nothing to delete", self._collection)
 
     async def upsert(
         self,

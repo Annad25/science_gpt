@@ -10,6 +10,7 @@ datasets — just drop any CSV into ``data/`` and restart.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,104 @@ class WHODataStore:
             f"{len(self._source_map)} CSV file(s), columns={self.columns}"
         )
 
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """Normalise free text for matching against schema values."""
+        lowered = text.lower().strip()
+        lowered = re.sub(r"['’]s\b", "", lowered)
+        lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+        return re.sub(r"\s+", " ", lowered).strip()
+
+    def build_search_terms(self, query: str) -> list[str]:
+        """Tokenise user text into normalised search terms."""
+        stop_words = {
+            "the", "a", "an", "is", "of", "in", "for", "and", "or", "to",
+            "on", "at", "by", "it", "its", "be", "as", "do", "has", "have",
+            "was", "were", "with", "what", "which", "how", "from", "that",
+        }
+
+        terms: list[str] = []
+        for token in self.normalize_text(query).split():
+            if token in stop_words or len(token) <= 1:
+                continue
+            terms.append(token)
+            # Recover singular forms from simple plurals / possessives like "germanys".
+            if token.endswith("s") and len(token) > 4:
+                singular = token[:-1]
+                if singular not in stop_words and len(singular) > 1:
+                    terms.append(singular)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            if term in seen:
+                continue
+            seen.add(term)
+            deduped.append(term)
+        return deduped
+
+    @property
+    def country_values(self) -> list[str]:
+        """Return canonical country values from the dataset."""
+        if "country" not in self.df.columns:
+            return []
+        values = self.df["country"].dropna().astype(str).tolist()
+        return list(dict.fromkeys(values))
+
+    def find_countries(self, text: str) -> list[str]:
+        """Return dataset countries mentioned in ``text``."""
+        normalized_text = self.normalize_text(text)
+        search_terms = set(self.build_search_terms(text))
+        matches: list[tuple[int, str]] = []
+
+        for country in self.country_values:
+            alias = self.normalize_text(country)
+            if not alias:
+                continue
+            if " " in alias:
+                pos = normalized_text.find(alias)
+                if pos >= 0:
+                    matches.append((pos, country))
+            elif alias in search_terms:
+                pos = normalized_text.find(alias)
+                matches.append((pos if pos >= 0 else len(normalized_text), country))
+
+        matches.sort(key=lambda item: (item[0], item[1]))
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for _, country in matches:
+            if country in seen:
+                continue
+            seen.add(country)
+            ordered.append(country)
+        return ordered
+
+    def canonicalize_value(self, column: str, value: Any) -> Any:
+        """Return the canonical dataset value for a string field when possible."""
+        if value is None or column not in self.df.columns:
+            return value
+
+        series = self.df[column]
+        if series.dtype != object:
+            return value
+
+        if column == "country":
+            countries = self.find_countries(str(value))
+            if countries:
+                return countries[0]
+
+        normalized = self.normalize_text(str(value))
+        value_map = {
+            self.normalize_text(str(item)): str(item)
+            for item in series.dropna().astype(str).unique().tolist()
+        }
+
+        if normalized in value_map:
+            return value_map[normalized]
+        if normalized.endswith("s") and normalized[:-1] in value_map:
+            return value_map[normalized[:-1]]
+        return value
+
     async def query(
         self,
         filters: dict[str, Any] | None = None,
@@ -126,19 +225,39 @@ class WHODataStore:
         """
         df = self.df.copy()
         if filters:
+            invalid_filters = [col for col in filters if col.lower() not in df.columns]
+            if invalid_filters:
+                raise ValueError(f"Invalid filter columns: {invalid_filters}")
+
             for col, val in filters.items():
                 col_lower = col.lower()
-                if col_lower not in df.columns:
-                    continue
-                if df[col_lower].dtype == object:
-                    df = df[df[col_lower].str.lower() == str(val).lower()]
+                series = df[col_lower]
+                if isinstance(val, (list, tuple, set)):
+                    values = list(val)
+                    if not values:
+                        return "No matching rows found."
+                    if series.dtype == object:
+                        normalized_values = {
+                            str(self.canonicalize_value(col_lower, item)).lower()
+                            for item in values
+                        }
+                        df = df[series.astype(str).str.lower().isin(normalized_values)]
+                    else:
+                        df = df[series.isin(values)]
+                elif series.dtype == object:
+                    canonical = self.canonicalize_value(col_lower, val)
+                    df = df[series.astype(str).str.lower() == str(canonical).lower()]
                 else:
-                    df = df[df[col_lower] == val]
+                    df = df[series == val]
         if columns:
             valid = [c for c in columns if c in df.columns]
+            if not valid:
+                raise ValueError(f"No valid columns selected from: {columns}")
             if valid:
                 df = df[valid]
         df = df.drop(columns=["_source_file"], errors="ignore").head(limit)
+        if df.empty:
+            return "No matching rows found."
         return df.to_csv(index=False)
 
     async def text_search(self, query: str, limit: int = 10) -> str:
@@ -148,25 +267,26 @@ class WHODataStore:
         ANY word appears in ANY string column.  Stop words are filtered
         out to reduce noise.
         """
-        stop_words = {
-            "the", "a", "an", "is", "of", "in", "for", "and", "or", "to",
-            "on", "at", "by", "it", "its", "be", "as", "do", "has", "have",
-            "was", "were", "with", "what", "which", "how", "from", "that",
-        }
-        words = [
-            w for w in query.lower().split()
-            if w not in stop_words and len(w) > 1
-        ]
+        words = self.build_search_terms(query)
         if not words:
-            words = query.lower().split()
+            words = self.normalize_text(query).split()
 
         df = self.df
         mask = pd.Series(False, index=df.index)
         str_cols = df.select_dtypes(include=["object"]).columns
         str_cols = [c for c in str_cols if c != "_source_file"]
+
+        normalized_cols = {
+            col: df[col]
+            .astype(str)
+            .map(self.normalize_text)
+            for col in str_cols
+        }
+
         for word in words:
-            for col in str_cols:
-                mask = mask | df[col].str.lower().str.contains(word, na=False)
+            pattern = rf"\b{re.escape(word)}\b"
+            for col, series in normalized_cols.items():
+                mask = mask | series.str.contains(pattern, na=False, regex=True)
         result = df[mask].drop(columns=["_source_file"], errors="ignore").head(limit)
         if result.empty:
             return "No matching rows found."
@@ -211,11 +331,12 @@ class WHODataStore:
         """
         df = self.df
         mask = pd.Series(False, index=df.index)
-        entity_lower = entity.lower()
+        entity_lower = self.normalize_text(entity)
         for col in df.select_dtypes(include=["object"]).columns:
             if col == "_source_file":
                 continue
-            mask = mask | df[col].str.lower().str.contains(entity_lower, na=False)
+            normalized = df[col].astype(str).map(self.normalize_text)
+            mask = mask | normalized.str.contains(rf"\b{re.escape(entity_lower)}\b", na=False, regex=True)
         result = df[mask].drop(columns=["_source_file"], errors="ignore")
         if result.empty:
             return ""
