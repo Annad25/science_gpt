@@ -1,0 +1,34 @@
+# Core
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# LLM & Agent Framework
+openai>=1.50.0
+langchain>=0.3.0,<0.4
+langchain-core>=0.3.0,<0.4
+langchain-openai>=0.2.0,<0.4
+langchain-text-splitters>=0.3.0,<0.4
+
+# Optional: LangChain Deep Agents for enhanced reasoning.
+# Requires langchain-core>=1.0 — install in a separate venv if needed:
+#   pip install deepagents>=0.4.0
+# The Reasoner agent falls back to direct OpenAI calls if deepagents is not installed.
+
+# Embeddings & Vector Store
+sentence-transformers>=3.0.0
+qdrant-client>=1.11.0
+
+# Data
+pandas>=2.2.0
+arxiv>=2.1.0
+PyMuPDF>=1.24.0
+
+# Cache
+cachetools>=5.5.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+httpx>=0.27.0
