@@ -1,201 +1,206 @@
-# Science GPT — Multi-Agent RAG Pipeline over Scientific Data
+# Science GPT
 
-A production-grade, multi-agent retrieval-augmented generation (RAG) system that ingests heterogeneous scientific sources, routes queries to specialised agents, synthesises answers via LangChain Deep Agents, and verifies outputs against source material.
+Multi-agent RAG over scientific data. Ask it anything — it routes the query, retrieves from two sources, reasons over the results, and checks its own answer.
 
-## Architecture
+---
+
+## How it works
 
 ```
-User Query
-    │
-    ▼
-┌──────────┐     ┌─────────────────────┐     ┌───────────┐     ┌───────────┐
-│  Router   │────▶│  Retrieval Agents   │────▶│  Reasoner │────▶│ Evaluator │
-│  Agent    │     │  (Vector+Structured)│     │ (Deep Agent)│    │ (LLM Judge)│
-└──────────┘     └─────────────────────┘     └───────────┘     └───────────┘
-    │                     │                        │                  │
-    │              ┌──────┴──────┐           ┌─────┴─────┐           │
-    │              ▼             ▼           ▼           ▼           │
-    │         Qdrant        WHO CSV     Calculator  Code Exec       │
-    │        (vectors)     (Pandas)    Summarizer                   │
-    └───────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    JSON Response + Sources + Latency
+Query
+  │
+  ▼
+Router ──► Retriever(s) ──► Reasoner ──► Evaluator ──► Response
+            │        │
+          Qdrant   WHO CSV
+         (arXiv)  (Pandas)
 ```
 
-### Pipeline Stages
+**Router** — classifies query as `text`, `structured`, or `hybrid` using LLM + keyword heuristics. Falls back to heuristic if LLM is slow.
 
-1. **Router Agent** — Classifies queries via LLM (with keyword-heuristic fallback) into `text`, `structured`, or `hybrid` and dispatches to the appropriate retriever(s).
+**Retriever** — runs in parallel:
+- *Vector*: embeds query with `all-MiniLM-L6-v2`, hits Qdrant for top-k arXiv chunks
+- *Structured*: parses filters/aggregations from the query, runs them on WHO CSV via Pandas
 
-2. **Retrieval Agents** — Run in parallel via `asyncio.gather()`:
-   - **Vector Retriever** — Encodes the query with `all-MiniLM-L6-v2` and searches Qdrant for top-k semantically similar chunks from arXiv papers.
-   - **Structured Retriever** — Uses LLM-based query parsing to extract filters/aggregations, then queries a WHO health statistics DataFrame via Pandas.
+**Dynamic ingestion** — if vector scores fall below threshold, fetches new arXiv papers on the fly and retries. No manual re-ingestion.
 
-3. **Reasoning Agent** — A LangChain Deep Agent (`deepagents.create_deep_agent`) synthesises the final answer using retrieved context + tools (calculator, code executor, summariser). Falls back to direct OpenAI if Deep Agents is unavailable.
+**Entity linker** — when a query spans both sources (e.g. "AI in healthcare + life expectancy in Japan"), enriches vector results with matching WHO rows.
 
-4. **Evaluator Agent** — LLM-as-judge that verifies every claim in the answer against source material, producing a verdict (`supported`, `partially_supported`, `not_supported`) with issues list.
+**Reasoner** — LangChain Deep Agent builds the final answer using retrieved context + tools. Falls back to direct OpenAI call if Deep Agent is unavailable.
 
-## Features Implemented
+**Evaluator** — LLM-as-judge. Checks every claim against source material. Fails the answer and returns a safe fallback if it doesn't hold up.
 
-### Level 1 — Core
-- [x] Ingestion pipeline for two source types (arXiv API + WHO CSV)
-- [x] Retrieval agent with routing to vector and structured search
-- [x] Reasoning agent with 3 tools beyond retrieval (calculator, summariser, sandboxed Python)
-- [x] Query API (`POST /query`) returning answer, sources, and latency breakdown
+---
 
-### Level 2 — Scalability
-- [x] **Concurrency isolation** — Each request gets a unique `trace_id` via `contextvars`; all agents are stateless and async; no shared mutable state between requests
-- [x] **Intelligent caching** — In-memory TTL cache with hash-based keys. `POST /cache/invalidate` for manual busting. `POST /ingest` re-indexes and auto-invalidates the cache, preventing stale results after data refresh
-- [x] **Entity traversal** — The Structured Retriever can parse complex queries (group-by aggregations, multi-column filters), traversing relationships between countries, years, and health metrics
+## What's built
 
-### Level 3 — Robustness
-- [x] **Hallucination detection** — Evaluator Agent (LLM-as-judge) checks every claim against sources. Answers that fail verification are replaced with a safe fallback
-- [x] **Systematic evaluation** — `python -m app.evaluation.systematic` runs 8 diverse test questions through the pipeline and produces a JSON report with per-question verdicts, routing accuracy, and latency statistics
-- [x] **Sandboxed code execution** — AST-based static analysis blocks dangerous imports/builtins. Code runs in a subprocess with empty environment, timeout, and output cap
+**Core**
+- Two sources: arXiv (papers → chunks → Qdrant) and WHO health stats (CSV → Pandas)
+- Router with LLM + heuristic fallback
+- Parallel vector + structured retrieval
+- Reasoner with 3 tools: calculator, summariser, sandboxed Python executor
+- `POST /query` returns answer, sources, evaluation verdict, per-stage latency
 
-## Setup & Configuration
+**Scalability**
+- Fully async — concurrent requests don't block each other
+- Per-request `trace_id` via `contextvars` for clean isolated logs
+- TTL query cache (10 min default), auto-invalidated on `POST /ingest`
+- File-based Qdrant — vectors survive restarts, no Docker needed
+- Paper cache (`data/arxiv_cache.json`) — arXiv papers persist across restarts, no re-download
+- Dynamic ingestion — fetches on demand, persists to cache
 
-### Prerequisites
-- Python 3.11+
-- An OpenAI API key
+**Robustness**
+- Evaluator rejects hallucinated answers and returns a fallback
+- `POST /evaluate` runs a benchmark: routing accuracy, support rate, refusal rate, p95 latency
+- Code executor: AST-based static analysis blocks dangerous imports before running anything
 
-### Quick Start
+---
+
+## Setup
+
+**Requirements:** Python 3.11+, OpenAI API key
 
 ```bash
-# Clone the repo
 git clone <repo-url> && cd science_gpt
-
-# Create virtual environment
 python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-
-# Install dependencies
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# Configure environment
-cp .env.example .env
-# Edit .env and set your OPENAI_API_KEY
-
-# Run the service
+cp .env.example .env             # add your OPENAI_API_KEY
 python run.py
 ```
 
-The service starts on `http://localhost:8000`. On first startup, it:
-1. Downloads the `all-MiniLM-L6-v2` embedding model (~80MB, cached after first run)
-2. Fetches ~15 papers from arXiv (takes 30-60s)
-3. Chunks, embeds, and indexes them into Qdrant (in-memory)
-4. Loads the WHO CSV dataset
+First run: downloads the embedding model (~80MB), fetches ~40 papers from arXiv, chunks and indexes them. Takes 1–3 min.
 
-### Docker
+After that: Qdrant and paper cache are on disk — restarts are instant.
 
+**Docker:**
 ```bash
 docker compose up --build
 ```
 
-### Environment Variables
+---
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_API_KEY` | (required) | OpenAI API key |
-| `LLM_MODEL` | `gpt-4o` | Model for reasoning/evaluation |
-| `QDRANT_MODE` | `memory` | `memory`, `docker`, or `cloud` |
-| `RETRIEVAL_TOP_K` | `5` | Number of vector search results |
-| `CHUNK_SIZE` | `800` | Characters per text chunk |
-| `CACHE_TTL_SECONDS` | `600` | Cache entry lifetime |
-| `ARXIV_MAX_PAPERS` | `15` | Papers to fetch per query |
+## Config
+
+All settings in `.env`. Key ones:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `OPENAI_API_KEY` | required | Your OpenAI key |
+| `LLM_MODEL` | `gpt-5-mini` | Model for routing, reasoning, evaluation |
+| `QDRANT_MODE` | `file` | `memory`, `file`, `docker`, or `cloud` |
+| `QDRANT_PATH` | `./qdrant_data` | Where vectors live on disk |
+| `RETRIEVAL_TOP_K` | `5` | Results per retriever |
+| `CHUNK_SIZE` | `800` | Characters per chunk |
+| `CACHE_TTL_SECONDS` | `600` | Query cache TTL |
+| `ARXIV_MAX_PAPERS` | `8` | Papers fetched per topic at startup |
+| `DYNAMIC_INGESTION_ENABLED` | `true` | Fetch new papers when relevance is low |
+| `DYNAMIC_INGESTION_SCORE_THRESHOLD` | `0.45` | Score that triggers dynamic fetch |
 
 See `.env.example` for the full list.
 
-## API Reference
+---
 
-### `POST /query`
+## API
+
+**`POST /query`**
 ```json
-{
-  "query": "What is the life expectancy in Japan and how does AI help healthcare?"
-}
+{ "query": "What is the life expectancy in Japan and how does AI help healthcare?" }
 ```
-
-Response:
+Returns:
 ```json
 {
-  "answer": "Based on the available sources...",
+  "answer": "...",
   "query_type": "hybrid",
-  "sources": [
-    {"source": "arXiv:...", "chunk_id": "...", "relevance_score": 0.87, "text_snippet": "..."}
-  ],
-  "evaluation": {
-    "verdict": "supported",
-    "confidence": 0.95,
-    "issues": []
-  },
+  "sources": [{ "source": "arXiv:...", "relevance_score": 0.87, "text_snippet": "..." }],
+  "evaluation": { "verdict": "supported", "confidence": 0.95, "issues": [] },
   "latency": {
-    "routing_ms": 450.2,
-    "retrieval_ms": 120.5,
-    "reasoning_ms": 2100.3,
-    "evaluation_ms": 800.1,
-    "total_ms": 3471.1
+    "routing_ms": 420,
+    "retrieval_ms": 130,
+    "dynamic_ingestion_ms": 0,
+    "reasoning_ms": 2100,
+    "evaluation_ms": 780,
+    "total_ms": 3430
   },
   "cached": false
 }
 ```
 
-### `POST /ingest` — Re-run ingestion, invalidate cache
-### `POST /cache/invalidate?query=...` — Bust specific or all cache entries
-### `GET /health` — Liveness check
-### `GET /stats` — Pipeline statistics
+**`POST /ingest?force=false`** — re-run ingestion, invalidate cache. `force=true` wipes and rebuilds Qdrant from scratch.
 
-## Running Tests
+**`POST /cache/invalidate?query=...`** — bust one query or the whole cache.
 
-```bash
-pytest tests/ -v
-```
+**`POST /evaluate`** — run the benchmark. Returns routing accuracy, support/partial/refusal rates, avg latency.
 
-## Running Systematic Evaluation
+**`GET /health`** — liveness check.
 
-```bash
-python -m app.evaluation.systematic
-```
+**`GET /stats`** — vector count, cache size, ingestion stats.
 
-Outputs a JSON report with per-question verdicts, routing accuracy, and latency p95.
+---
 
-## Key Architectural Decisions
+## Architectural decisions
 
-### Why explicit agent orchestration over monolithic chains?
-We deliberately avoid LangChain's `RetrievalQA` or `AgentExecutor` black-box chains. Instead, each stage (Route → Retrieve → Reason → Evaluate) is an explicit Python async call. This makes the pipeline transparent, testable, and debuggable — you can see exactly what each agent does in the logs. We use LangChain Deep Agents only for the reasoning step, where its planning and context-management capabilities add genuine value.
+**Explicit orchestration, not chains**
 
-### Why Qdrant in-memory over ChromaDB?
-Qdrant's in-memory mode gives us a production-grade vector store API (with payload filtering, hybrid search support, and well-typed Python client) without requiring Docker or a running service. ChromaDB is simpler but lacks Qdrant's filtering and production features. Switching to Docker or Cloud mode is a one-line config change (`QDRANT_MODE=docker`).
+Each stage (route → retrieve → reason → evaluate) is a plain async call. Nothing hidden in a black-box chain. Logs show exactly what happened at each step. LangChain Deep Agent is only used for reasoning, where its planning actually adds value.
 
-### Why arXiv abstracts instead of full PDFs?
-Full PDF parsing is expensive, error-prone, and slow. arXiv abstracts are dense, high-quality summaries that capture the key findings of each paper. For a 24-hour build, this gives 90% of the value at 10% of the complexity. The ingestion pipeline is designed to be extensible — adding full-text PDF parsing is a matter of adding a PDF loader to `arxiv_loader.py`.
+**File-based Qdrant**
 
-### Why AST-based code sandboxing instead of Docker containers?
-Docker-in-Docker or container-per-execution adds significant infrastructure complexity. Our AST-based approach statically validates code before execution, blocks dangerous imports/builtins at parse time, and runs in a subprocess with an empty environment and strict timeout. This is sufficient for the computation-only use case (math, statistics, data analysis) while being deployable anywhere Python runs.
+In-memory Qdrant is gone on restart — you'd re-fetch and re-embed every time. File mode gives the same API with persistence. No Docker needed. Switch to Docker or cloud with one env var (`QDRANT_MODE=docker`).
 
-### Why LLM-as-judge for evaluation?
-Research on LLM hallucination detection shows that using a second LLM as a critic (with explicit instructions to check source attribution) catches a significant fraction of fabricated claims. This is more flexible than rule-based checking and doesn't require maintaining a separate NLI model. The trade-off is cost (an extra LLM call per query), which is acceptable for correctness-critical scientific QA.
+**Two-layer caching**
 
-## LLM Conversation
+Paper cache (disk) — arXiv PDFs aren't downloaded twice. Query cache (memory, TTL) — repeated queries skip the LLM. Both layers are independent, both have invalidation paths.
 
-This project was designed and built through an extensive conversation with Claude (Anthropic), covering:
-- Architecture design: choosing explicit agent orchestration over monolithic chains
-- Deep Agents SDK integration: researching and integrating `deepagents.create_deep_agent`
-- Data source selection: evaluating arXiv API vs. local PDFs, WHO CSV format
-- Sandboxing strategy: designing AST-based code validation vs. Docker isolation
-- Hallucination prevention: implementing the LLM-as-judge pattern
+**Dynamic ingestion**
 
-## What I Would Do Differently With More Time
+Static startup ingestion can't cover every topic. When average retrieval score is below threshold, the pipeline fetches papers for that query, indexes them, and retries — all in the same request. New papers persist to disk for next time.
 
-1. **Learned router** — Replace the LLM+heuristic router with a fine-tuned classification model (or use the Deep Agent framework itself to spawn sub-agents dynamically).
-2. **Full-text PDF ingestion** — Add a PDF parser (e.g., `pymupdf4llm`) to index full paper bodies, not just abstracts, with section-aware chunking.
-3. **Hybrid reranking** — Add a cross-encoder reranker (e.g., `ms-marco-MiniLM-L-6-v2`) after initial retrieval to improve precision.
-4. **Graph-based entity linking** — Use Neo4j to model relationships between papers, authors, concepts, and health metrics, enabling multi-hop reasoning.
-5. **Streaming responses** — Use FastAPI's `StreamingResponse` with LangGraph's streaming to show intermediate agent steps in real-time.
-6. **Redis caching** — Replace in-memory cache with Redis for persistence across restarts and distributed deployments.
+**LLM-as-judge**
 
-## Known Limitations
+A second LLM call checks the answer against sources. Adds ~800ms. For scientific QA where correctness matters, it's worth it.
 
-- **In-memory Qdrant** — Vector data is lost on restart. Use `QDRANT_MODE=docker` for persistence.
-- **arXiv rate limits** — The arXiv API is rate-limited; large ingestion runs may be throttled.
-- **No authentication** — The API has no auth layer. Add API key middleware for production.
-- **Embedding model size** — `all-MiniLM-L6-v2` is fast but not state-of-the-art. Consider `nomic-embed-text` or OpenAI embeddings for higher quality.
+---
+
+## LLM conversation
+
+Built and debugged with Claude Code. Two parts worth mentioning:
+
+### Why the pipeline kept refusing to answer
+
+Traced through 6 layers to find the root cause: topic coverage gap → embedding quality → chunk size → prompt wording → evaluator strictness → fallback logic. Each layer looked fine in isolation; the issue only appeared when they combined.
+
+![Diagnosis table](docs/screenshot_diagnosis_table.png)
+
+---
+
+### Dynamic ingestion design
+
+Three options were on the table: pre-fetch extra topics at startup, background async fetch, or inline on-demand fetch. Went with inline because it's the simplest path that actually solves the problem — no background jobs, no state to manage, works within the existing request.
+
+![Dynamic ingestion design - part 1](docs/dynamic_ingestion_1.png)
+![Dynamic ingestion design - part 2](docs/dynamic_ingestion_2.png)
+
+---
+
+## What I'd do differently with more time
+
+**Cross-encoder reranker** — `all-MiniLM-L6-v2` is fast but weak at ranking. A cross-encoder like `ms-marco-MiniLM-L-6-v2` as a second pass would improve precision.
+
+**Learned router** — current LLM+heuristic router works but costs a full LLM call per query. A small fine-tuned classifier would be faster and more consistent.
+
+**Full PDF ingestion** — using abstracts only right now. Section-aware chunking with `pymupdf4llm` would give much richer context.
+
+**Redis cache** — in-memory query cache is lost on restart. Redis would persist it across restarts and instances.
+
+**Streaming** — `StreamingResponse` + LangGraph streaming to show reasoning steps live.
+
+---
+
+## Known limitations
+
+- arXiv rate limits can slow large ingestion runs
+- `all-MiniLM-L6-v2` degrades on long or highly technical queries
+- No auth on the API — add middleware before exposing publicly
+- Dynamic ingestion adds latency on first query for a new topic
+- `gpt-5-mini` doesn't support `temperature=0` — all calls use `temperature=1`
