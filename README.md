@@ -164,9 +164,11 @@ A second LLM call checks the answer against sources. Adds ~800ms. For scientific
 
 ## LLM conversation
 
-Built and debugged with Claude Code. Two parts worth mentioning:
+Debugged with claude. Two parts worth mentioning:
 
 ### Why the pipeline kept refusing to answer
+**My question:**
+> it kind of mentions at last "if you want more detail I can't provide that" — which is a concern. Did it not get the data? Are we fetching too little information? Is it an embedding/similarity mismatch? Or is the article just not present? Or is it a prompting issue? Trying to understand the reasons first. Don't do any code changes — I want to think through this first.
 
 Traced through 6 layers to find the root cause: topic coverage gap → embedding quality → chunk size → prompt wording → evaluator strictness → fallback logic. Each layer looked fine in isolation; the issue only appeared when they combined.
 
